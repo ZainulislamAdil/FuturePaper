@@ -1,0 +1,231 @@
+
+
+
+# -------------------------
+# ---  Helper functions  ---
+# -------------------------
+
+def load_and_preprocess(csv_path="dns.csv", n_features=34):
+    """
+    Load csv, basic cleaning, return X (numpy) and y (numpy labels)
+    Assumes last column is label.
+    """
+    df = pd.read_csv(csv_path)
+    # minimal cleaning - if any object columns exist that are numeric strings, attempt conversion
+    # (preserve your original IP/time conversions if needed)
+    df = df.copy()
+    # fill NaNs
+    df.fillna(0, inplace=True)
+    # assume last column is label
+    X = df.iloc[:, :n_features].values.astype(float)
+    y = df.iloc[:, n_features].values.astype(int).reshape(-1)
+    # scale features [0,1]
+    scaler = MinMaxScaler()
+    X = scaler.fit_transform(X)
+    return X, y
+
+def build_lstm_gru(input_shape):
+    """Builds a hybrid LSTM+GRU model (two branches merged)."""
+    # LSTM branch: input shape (timesteps, features) -> here we will use (1, features)
+    inp_lstm = Input(shape=input_shape, name="lstm_input")
+    x = LSTM(200, return_sequences=True, activation='relu')(inp_lstm)
+    x = LSTM(150, return_sequences=True, activation='relu')(x)
+    x = LSTM(75, return_sequences=False, activation='relu')(x)
+
+    # GRU branch
+    inp_gru = Input(shape=input_shape, name="gru_input")
+    g = GRU(200, return_sequences=True, activation='relu')(inp_gru)
+    g = GRU(150, return_sequences=True, activation='relu')(g)
+    g = GRU(75, return_sequences=False, activation='relu')(g)
+
+    # merge (Add)
+    merged = Add()([x, g])
+    out = Dense(45, activation='relu')(merged)
+    out = Dense(20, activation='relu')(out)
+    out = Dense(2, activation='softmax')(out)
+
+    model = Model([inp_lstm, inp_gru], out, name="LSTM-GRU")
+    model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+    return model
+
+def build_cnn_gru(n_features):
+    """
+    Builds a hybrid CNN + GRU model.
+    CNN branch expects shape (1,1,features) to apply 2D conv on 'features' channel.
+    GRU branch expects (timesteps, features) e.g. (1, features).
+    """
+    # CNN branch input: (1,1,n_features)
+    inp_cnn = Input(shape=(1,1,n_features), name="cnn_input")
+    c = Conv2D(filters=128, kernel_size=(1,1), activation='relu')(inp_cnn)
+    c = Conv2D(filters=64, kernel_size=(1,1), activation='relu')(c)
+    c = Flatten()(c)
+    c = Dense(64, activation='relu')(c)
+
+    # GRU branch
+    inp_gru = Input(shape=(1,n_features), name="gru_input")
+    g = GRU(128, return_sequences=True, activation='relu')(inp_gru)
+    g = GRU(64, return_sequences=False, activation='relu')(g)
+
+    # merge
+    merged = Add()([c, g])
+    out = Dense(45, activation='relu')(merged)
+    out = Dense(20, activation='relu')(out)
+    out = Dense(2, activation='softmax')(out)
+
+    model = Model([inp_cnn, inp_gru], out, name="CNN-GRU")
+    model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+    return model
+
+def build_dnn_gru(n_features):
+    """
+    Builds a hybrid DNN + GRU model.
+    DNN branch uses dense layers on raw features.
+    GRU branch uses recurrent layers on (1, features).
+    """
+    inp_dnn = Input(shape=(n_features,), name="dnn_input")
+    d = Dense(256, activation='relu')(inp_dnn)
+    d = Dense(128, activation='relu')(d)
+    d = Dense(64, activation='relu')(d)
+
+    inp_gru = Input(shape=(1,n_features), name="gru_input")
+    g = GRU(128, return_sequences=True, activation='relu')(inp_gru)
+    g = GRU(64, return_sequences=False, activation='relu')(g)
+
+    # Before adding, make sure d and g have same shape; if needed, project to same dim
+    # project both to 64-dim
+    d_proj = Dense(64, activation='relu')(d)
+    g_proj = Dense(64, activation='relu')(g)
+
+    merged = Add()([d_proj, g_proj])
+    out = Dense(45, activation='relu')(merged)
+    out = Dense(20, activation='relu')(out)
+    out = Dense(2, activation='softmax')(out)
+
+    model = Model([inp_dnn, inp_gru], out, name="DNN-GRU")
+    model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+    return model
+
+# -------------------------
+# ---  Training wrapper ---
+# -------------------------
+
+def train_and_evaluate(model_builder, X, y, model_name, n_features, folds=5, epochs=10, batch_size=32):
+    """
+    model_builder: function to build model
+    X: numpy array (n_samples, n_features)
+    y: numpy array labels (n_samples,)
+    model_name: string to name saved models
+    """
+    skf = StratifiedKFold(n_splits=folds, shuffle=True, random_state=0)
+    fold_no = 0
+    accs = []
+    for train_idx, test_idx in skf.split(X, y):
+        fold_no += 1
+        print(f"\n=== {model_name} - Fold {fold_no}/{folds} ===")
+        X_train, X_test = X[train_idx], X[test_idx]
+        y_train, y_test = y[train_idx], y[test_idx]
+
+        # prepare inputs depending on model type
+        if model_name == "LSTM-GRU":
+            # both branches get (timesteps=1, features)
+            input_shape = (1, n_features)
+            model = build_lstm_gru(input_shape)
+            Xtr_a = X_train.reshape((-1, 1, n_features))
+            Xtr_b = Xtr_a.copy()
+            Xte_a = X_test.reshape((-1, 1, n_features))
+            Xte_b = Xte_a.copy()
+
+            inputs_train = [Xtr_a, Xtr_b]
+            inputs_test = [Xte_a, Xte_b]
+
+        elif model_name == "CNN-GRU":
+            model = build_cnn_gru(n_features)
+            # CNN branch expects (samples,1,1,features)
+            Xtr_cnn = X_train.reshape((-1, 1, 1, n_features))
+            Xte_cnn = X_test.reshape((-1, 1, 1, n_features))
+            # GRU branch expects (samples,1,features)
+            Xtr_gru = X_train.reshape((-1, 1, n_features))
+            Xte_gru = X_test.reshape((-1, 1, n_features))
+
+            inputs_train = [Xtr_cnn, Xtr_gru]
+            inputs_test  = [Xte_cnn, Xte_gru]
+
+        elif model_name == "DNN-GRU":
+            model = build_dnn_gru(n_features)
+            # DNN branch: (samples, features)
+            Xtr_dnn = X_train.reshape((-1, n_features))
+            Xte_dnn = X_test.reshape((-1, n_features))
+            # GRU branch: (samples,1,features)
+            Xtr_gru = X_train.reshape((-1, 1, n_features))
+            Xte_gru = X_test.reshape((-1, 1, n_features))
+
+            inputs_train = [Xtr_dnn, Xtr_gru]
+            inputs_test  = [Xte_dnn, Xte_gru]
+
+        else:
+            raise ValueError("Unknown model_name")
+
+        # prepare labels
+        num_classes = 2
+        ytr_cat = to_categorical(y_train, num_classes)
+        yte_cat = to_categorical(y_test, num_classes)
+
+        model.summary()
+
+        t1 = datetime.datetime.now()
+        model.fit(inputs_train, ytr_cat, epochs=epochs, batch_size=batch_size, verbose=1)
+        t2 = datetime.datetime.now()
+        print("Training time:", t2 - t1)
+
+        t1 = datetime.datetime.now()
+        preds = model.predict(inputs_test)
+        t2 = datetime.datetime.now()
+        print("Testing time:", t2 - t1)
+
+        preds_labels = preds.argmax(axis=1)
+        acc = accuracy_score(y_test, preds_labels)
+        print(f"Fold {fold_no} Accuracy: {acc*100:.2f}%")
+        print(classification_report(y_test, preds_labels))
+
+        # save model
+        save_path = f"Saved_Models/{model_name}_fold{fold_no}.keras"
+        os.makedirs("Saved_Models", exist_ok=True)
+        model.save(save_path)
+        print("Saved model to", save_path)
+
+        accs.append(acc)
+
+    print(f"\n=== {model_name} summary over {folds} folds ===")
+    print("Mean Accuracy: {:.2f}% (+/- {:.2f}%)".format(np.mean(accs)*100, np.std(accs)*100))
+    return accs
+
+# -------------------------
+# ---  Main execution  ---
+# -------------------------
+if __name__ == "__main__":
+    # adjust path if needed
+    csv_path = "dns.csv"
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"{csv_path} not found. Please ensure preprocessed dns.csv is in working dir.")
+
+    # load
+    X, y = load_and_preprocess(csv_path=csv_path, n_features=34)
+    # shuffle
+    p = np.random.RandomState(0).permutation(len(y))
+    X, y = X[p], y[p]
+
+    # you can reduce folds/epochs for quick debugging
+    folds = 5
+    epochs = 10
+    batch_size = 32
+    n_features = X.shape[1]
+
+    # Train & evaluate the three hybrids
+    train_and_evaluate(build_lstm_gru, X, y, model_name="LSTM-GRU",
+                       n_features=n_features, folds=folds, epochs=epochs, batch_size=batch_size)
+
+    train_and_evaluate(build_cnn_gru, X, y, model_name="CNN-GRU",
+                       n_features=n_features, folds=folds, epochs=epochs, batch_size=batch_size)
+
+    train_and_evaluate(build_dnn_gru, X, y, model_name="DNN-GRU",
+                       n_features=n_features, folds=folds, epochs=epochs, batch_size=batch_size)
